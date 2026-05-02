@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -33,8 +33,8 @@ var kexecCmd = &cobra.Command{
 		cmdLine := os.Getenv("CMD_LINE")
 		grubCfgPath := os.Getenv("GRUBCFG_PATH")		
 
-		// These two strings contain the updated paths including the mountAction path
-		var kernelMountPath, initrdMountPath string
+		var kernelMountPath string
+		var initrdMountPaths []string
 
 		if blockDevice == "" {
 			log.Fatalf("No Block Device speified with Environment Variable [BLOCK_DEVICE]")
@@ -60,7 +60,7 @@ var kexecCmd = &cobra.Command{
 		// If we specify no kernelPath then we will fallback to autodetect and ignore the initrd and cmdline that may be passed
 		// by environment variables
 		if kernelPath == "" {
-			grubFile, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", mountAction, grubCfgPath))
+			grubFile, err := os.ReadFile(fmt.Sprintf("%s/%s", mountAction, grubCfgPath))
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -70,27 +70,30 @@ var kexecCmd = &cobra.Command{
 			}
 			log.Infof("Loaded boot config: %#v", bootConfig)
 			kernelMountPath = filepath.Join(mountAction, bootConfig.Kernel)
-			initrdMountPath = filepath.Join(mountAction, bootConfig.Initramfs)
+			for _, p := range bootConfig.Initramfs {
+				initrdMountPaths = append(initrdMountPaths, filepath.Join(mountAction, p))
+			}
 			// Overwrite the cmdline with what is found in grub.conf, unless something specific is added
 			if cmdLine == "" {
 				cmdLine = bootConfig.KernelArgs
 			}
 		} else {
 			kernelMountPath = filepath.Join(mountAction, kernelPath)
-			initrdMountPath = filepath.Join(mountAction, initrdPath)
+			initrdMountPaths = []string{filepath.Join(mountAction, initrdPath)}
 		}
-		// /mountAction/boot/vmlinuz
-		kernel, err := os.Open(kernelMountPath) // For read access.
-		if err != nil {
-			log.Fatal(err)
-		}
-		// /mountAction/boot/vmlinuz
-		initrd, err := os.Open(initrdMountPath) // For read access.
+
+		kernel, err := os.Open(kernelMountPath)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		log.Infof("Running Kexec: kernel: %s, initrd: %s, cmdLine: %v", kernelMountPath, initrdMountPath, cmdLine)
+		initrd, err := openInitrd(initrdMountPaths)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer os.Remove(initrd.Name())
+
+		log.Infof("Running Kexec: kernel: %s, initrd: %v, cmdLine: %v", kernelMountPath, initrdMountPaths, cmdLine)
 		// Load the kernel configuration into memory
 		err = unix.KexecFileLoad(int(kernel.Fd()), int(initrd.Fd()), cmdLine, 0)
 		if err != nil {
@@ -108,4 +111,39 @@ func Execute() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+}
+
+// openInitrd returns a file ready for KexecFileLoad. For a single initrd it
+// opens the file directly; for multiple initrds it concatenates them into a
+// temp file (the Linux kernel accepts concatenated cpio archives).
+func openInitrd(paths []string) (*os.File, error) {
+	if len(paths) == 1 {
+		return os.Open(paths[0])
+	}
+	if err := os.MkdirAll("/tmp", 0755); err != nil {
+		return nil, fmt.Errorf("creating /tmp: %w", err)
+	}
+	tmp, err := os.CreateTemp("/tmp", "initrd-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating temp initrd: %w", err)
+	}
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return nil, fmt.Errorf("opening initrd %s: %w", p, err)
+		}
+		_, err = io.Copy(tmp, f)
+		f.Close()
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return nil, fmt.Errorf("copying initrd %s: %w", p, err)
+		}
+	}
+	name := tmp.Name()
+	tmp.Close()
+	// Reopen read-only — KexecFileLoad rejects files with writable fds open (ETXTBSY).
+	return os.Open(name)
 }
